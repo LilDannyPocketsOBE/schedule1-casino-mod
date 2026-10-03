@@ -20,6 +20,7 @@ namespace CasinoExpansion.Casino
         private int _round;
         private bool _dealing;
         private bool _dealtThisReady;
+        private bool _cancelRequested;
 
         public string LastResult { get; private set; } = "";
         public float Stake { get; set; } = 10f;
@@ -60,6 +61,19 @@ namespace CasinoExpansion.Casino
             if (!Sessions.TryGetValue(id, out var session))
                 Sessions[id] = session = new TableSession(controller);
             return session;
+        }
+        public static void CancelFor(Controller controller)
+        {
+            if (controller == null) return;
+
+            if (Sessions.TryGetValue(controller.GetInstanceID(), out var session))
+                session.CancelFromClose();
+        }
+
+        private void CancelFromClose()
+        {
+            _cancelRequested = true;
+            
         }
 
         public static void TickAll()
@@ -122,26 +136,6 @@ namespace CasinoExpansion.Casino
             catch { return true; }   // never block a round on a replication hiccup
         }
 
-        // Seat 0 is the deck's authority: it rolls the shared seed, everyone else only reads
-        // it back. Picking the lowest seat rather than "whoever is host" needs no extra lookup
-        // -- LocalSeat is already how every client finds its own position.
-        private bool IsAuthority => TableCards.LocalSeat(_controller) == 0;
-
-        private int ReadSeed(string key)
-        {
-            try
-            {
-                var players = _controller.Players;
-                if (players == null) return 0;
-
-                var data = players.GetPlayerData(0);
-                if (data == null) return 0;
-
-                return (int)data.GetData<float>(key);
-            }
-            catch { return 0; }
-        }
-
         public void PublishChoice(ETableGame game)
         {
             try
@@ -154,6 +148,7 @@ namespace CasinoExpansion.Casino
         private System.Collections.IEnumerator RunRound(ITableGame game)
         {
             _dealing = true;
+            _cancelRequested = false;
             _round++;
 
             float stake = Mathf.Clamp(BuyIn(game), game.Limits.Min, game.Limits.Max);
@@ -164,69 +159,44 @@ namespace CasinoExpansion.Casino
                 LastResult = $"Not enough cash: need ${stake:N0}, have ${bal:N0}";
                 MelonLogger.Msg($"[session] {LastResult}");
 
-                // Hand ready back, or the table keeps retrying the same unaffordable stake
-                // several times a second for as long as the flag stays set.
-                try { if (AllReady()) _controller.ToggleLocalPlayerReady(); } catch { }
+                try
+                {
+                    if (AllReady())
+                        _controller.ToggleLocalPlayerReady();
+                }
+                catch { }
 
                 _dealing = false;
                 yield break;
             }
 
-            // Which side to back, asked after the money is down and before any card is seen --
-            // which is when a real table takes it. It used to be a toggle on the bet panel,
-            // made before betting, which is the wrong way round.
             if (game.Sides.Length > 0)
             {
                 yield return MelonCoroutines.Start(Ask(
-                    $"${stake:N0} on which side?", game.Sides, i => Side = i, 20f, 0));
+                    $"${stake:N0} on which side?",
+                    game.Sides,
+                    i => Side = i,
+                    20f,
+                    0));
+
+                if (_cancelRequested)
+                    yield break;
             }
 
-            // Seed kept inside the float-exact range so it can be replicated verbatim: every
-            // client rebuilds the identical deck rather than having cards sent to it. Only
-            // seat 0 rolls one; everyone else reads it back, so two seated players are dealt
-            // the same hand instead of each inventing -- and getting paid out on -- their own.
-            string seedKey = $"{Keys.Seed(_gameId)}:{_round}";
-            int seed;
-
-            if (IsAuthority)
-            {
-                seed = UnityEngine.Random.Range(1, RoundState.MaxExactInt);
-                try { _controller.LocalPlayerData?.SetData<float>(seedKey, (float)seed, true); }
-                catch (Exception e) { MelonLogger.Warning($"[session] could not publish seed: {e.Message}"); }
-            }
-            else
-            {
-                // Falls back to a local roll after two seconds. A round that stalls waiting for
-                // a seed is worse than one dealt from the wrong deck -- and the money guard
-                // below is what actually stops a divergence being paid out twice.
-                seed = 0;
-                float deadline = Time.unscaledTime + 2f;
-                while (seed == 0 && Time.unscaledTime < deadline)
-                {
-                    seed = ReadSeed(seedKey);
-                    if (seed == 0) yield return null;
-                }
-
-                if (seed == 0)
-                {
-                    seed = UnityEngine.Random.Range(1, RoundState.MaxExactInt);
-                    MelonLogger.Warning($"[session] no seed from seat 0 after 2s; dealt from a local roll");
-                }
-            }
+            int seed = UnityEngine.Random.Range(1, RoundState.MaxExactInt);
 
             var deck = new Deck(seed, game.Decks);
             var hands = new HandSet();
 
-            // The side the player picked travels with the round, so a game can read it from
-            // the hands rather than from the session -- which keeps Resolve pure and lets two
-            // tables run different choices at once.
             hands.Notes["side"] = Side;
+            hands.Notes["game"] = (float)(int)game.Id;
 
             game.Deal(hands, deck);
 
             LastResult = $"<b>{game.Title}</b>\n${stake:N0} staked\nDealing...";
 
             _placed = null;
+
             if (TableCards.Supported(_controller))
             {
                 TableCards.Clear(_controller);
@@ -234,55 +204,89 @@ namespace CasinoExpansion.Casino
             }
 
             yield return MelonCoroutines.Start(Show(hands));
+
+            if (_cancelRequested)
+                yield break;
+
             LastResult = Describe(game, hands);
 
-            // The decision, for games that have one. A game that draws mid-decision calls Show
-            // itself so the card lands as it is committed to; anything still unplaced when
-            // Decide returns is dealt here.
             var wager = new Wager(stake);
+
             if (game is IDecidingGame deciding)
             {
-                yield return MelonCoroutines.Start(deciding.Decide(this, hands, deck, wager));
+                yield return MelonCoroutines.Start(
+                    deciding.Decide(this, hands, deck, wager));
+
+                if (_cancelRequested)
+                    yield break;
+
                 yield return MelonCoroutines.Start(Show(hands));
+
+                if (_cancelRequested)
+                    yield break;
+
                 LastResult = Describe(game, hands);
             }
 
-            // Showdown: the dealer's hand turns over only once every decision is made.
             if (TableCards.Supported(_controller))
-                yield return MelonCoroutines.Start(TableCards.Reveal(_controller));
+                yield return MelonCoroutines.Start(
+                    TableCards.Reveal(_controller));
+
+            if (_cancelRequested)
+                yield break;
 
             LastResult = Describe(game, hands);
+
             yield return new WaitForSeconds(1.2f);
 
+            if (_cancelRequested)
+                yield break;
+
             var outcome = game.Resolve(hands, wager, Side);
-            if (outcome.Multiplier > 0f) Bank.ApplyPayout(_gameId, _round, wager.Total * outcome.Multiplier);
+
+            if (outcome.Multiplier > 0f)
+                Bank.ApplyPayout(
+                    _gameId,
+                    _round,
+                    wager.Total * outcome.Multiplier);
 
             float won = wager.Total * outcome.Multiplier;
-            LastResult = outcome.Multiplier > 1f ? $"<b>WON ${won - wager.Total:N0}</b>\n{outcome.Summary}"
-                       : outcome.Multiplier > 0f ? $"<b>Push</b>\n{outcome.Summary}"
-                       : $"<b>Lost ${wager.Total:N0}</b>\n{outcome.Summary}";
 
-            MelonLogger.Msg($"[session] round {_round} seed {seed} staked {wager.Total}: " +
-                            $"{outcome.Summary} -> x{outcome.Multiplier}");
+            LastResult =
+                outcome.Multiplier > 1f
+                    ? $"<b>WON ${won - wager.Total:N0}</b>\n{outcome.Summary}"
+                : outcome.Multiplier > 0f
+                    ? $"<b>Push</b>\n{outcome.Summary}"
+                : $"<b>Lost ${wager.Total:N0}</b>\n{outcome.Summary}";
+
+            MelonLogger.Msg(
+                $"[session] round {_round} seed {seed} staked {wager.Total}: " +
+                $"{outcome.Summary} -> x{outcome.Multiplier}");
 
             yield return new WaitForSeconds(1f);
 
-            // Give the table back. The controller still thinks a round is running otherwise,
-            // which leaves the ready flag set and forces a cancel-and-ready-up before the next
-            // hand will deal.
-            TableInterface.Finish();
-            if (TableCards.Supported(_controller)) TableCards.EndRound(_controller);
+            if (_cancelRequested)
+                yield break;
 
-            // Vanilla leaves the ready flag set after a hand. Clearing it is what turns the
-            // button back into Ready, so the next round is one press rather than cancel,
-            // ready, and wonder why nothing dealt.
+            TableInterface.Finish();
+
+            if (TableCards.Supported(_controller))
+                TableCards.EndRound(_controller);
+
             if (AllReady())
             {
-                try { _controller.ToggleLocalPlayerReady(); }
-                catch (Exception e) { MelonLogger.Warning($"[session] could not clear ready: {e.Message}"); }
+                try
+                {
+                    _controller.ToggleLocalPlayerReady();
+                }
+                catch (Exception e)
+                {
+                    MelonLogger.Warning(
+                        $"[session] could not clear ready: {e.Message}");
+                }
             }
-            _dealtThisReady = false;
 
+            _dealtThisReady = false;
             _dealing = false;
         }
 
@@ -334,7 +338,17 @@ namespace CasinoExpansion.Casino
             PromptOnTable = onTable;
 
             float deadline = Time.unscaledTime + timeout;
-            while (_answer < 0 && Time.unscaledTime < deadline) yield return null;
+            while (!_cancelRequested && _answer < 0 && Time.unscaledTime < deadline)
+                yield return null;
+
+            if (_cancelRequested)
+            {
+                Prompt = null;
+                Options = null;
+                PromptOnTable = false;
+                if (onTable) TableInterface.Hide();
+                yield break;
+            }
 
             int pick = _answer >= 0 ? _answer : Mathf.Clamp(fallback, 0, options.Length - 1);
             Prompt = null;

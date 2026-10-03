@@ -30,7 +30,10 @@ namespace CasinoExpansion.Casino
         private static Il2CppTMPro.TextMeshProUGUI _promptLabel;
         private static readonly List<Button> Buttons = new List<Button>();
         private static readonly List<Il2CppTMPro.TextMeshProUGUI> Labels = new List<Il2CppTMPro.TextMeshProUGUI>();
-
+        private static string _dealerScore;
+        private static string _playerScore;
+        private static Il2CppTMPro.TextMeshProUGUI _dealerScoreClone;
+        private static Il2CppTMPro.TextMeshProUGUI _playerScoreClone;
         private const int MaxChoices = 4;
 
         private static BjUI Interface()
@@ -225,14 +228,68 @@ namespace CasinoExpansion.Casino
         // place, and every game here has a dealer side and a player side.
         public static void Scores(string dealer, string player)
         {
+            _dealerScore = dealer;
+            _playerScore = player;
+            ApplyScores();
+        }
+
+        public static void TickScores()
+        {
+            if (Active == null) return;
+            if (_dealerScore == null || _playerScore == null) return;
+
+            ApplyScores();
+        }
+
+        private static void ApplyScores()
+        {
             var ui = Interface();
             if (ui == null) return;
 
             try
             {
                 ui.ShowScores();
-                if (ui.DealerScoreLabel != null) ui.DealerScoreLabel.text = dealer;
-                if (ui.PlayerScoreLabel != null) ui.PlayerScoreLabel.text = player;
+
+                if (_dealerScoreClone == null && ui.DealerScoreLabel != null)
+                {
+                    var go = Object.Instantiate(
+                        ui.DealerScoreLabel.gameObject,
+                        ui.DealerScoreLabel.transform.parent);
+
+                    go.name = "ModDealerScore";
+                    _dealerScoreClone =
+                        go.GetComponent<Il2CppTMPro.TextMeshProUGUI>();
+                }
+
+                if (_playerScoreClone == null && ui.PlayerScoreLabel != null)
+                {
+                    var go = Object.Instantiate(
+                        ui.PlayerScoreLabel.gameObject,
+                        ui.PlayerScoreLabel.transform.parent);
+
+                    go.name = "ModPlayerScore";
+                    _playerScoreClone =
+                        go.GetComponent<Il2CppTMPro.TextMeshProUGUI>();
+                }
+
+                // Hide vanilla's numbers so it can keep changing them invisibly.
+                if (ui.DealerScoreLabel != null)
+                    ui.DealerScoreLabel.enabled = false;
+
+                if (ui.PlayerScoreLabel != null)
+                    ui.PlayerScoreLabel.enabled = false;
+
+                if (_dealerScoreClone != null)
+                {
+                    _dealerScoreClone.enabled = true;
+                    _dealerScoreClone.text = _dealerScore;
+                }
+
+                if (_playerScoreClone != null)
+                {
+                    _playerScoreClone.enabled = true;
+                    _playerScoreClone.text = _playerScore;
+                }
             }
             catch { }
         }
@@ -241,7 +298,29 @@ namespace CasinoExpansion.Casino
         {
             Active = null;
             Hide();
-            try { Interface()?.HideScores(); } catch { }
+
+            try
+            {
+                var ui = Interface();
+
+                if (_dealerScoreClone != null)
+                    _dealerScoreClone.enabled = false;
+
+                if (_playerScoreClone != null)
+                    _playerScoreClone.enabled = false;
+
+                if (ui != null)
+                {
+                    if (ui.DealerScoreLabel != null)
+                        ui.DealerScoreLabel.enabled = true;
+
+                    if (ui.PlayerScoreLabel != null)
+                        ui.PlayerScoreLabel.enabled = true;
+
+                    ui.HideScores();
+                }
+            }
+            catch { }
         }
     }
 }

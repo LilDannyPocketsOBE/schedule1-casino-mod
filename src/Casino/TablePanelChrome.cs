@@ -37,6 +37,10 @@ namespace CasinoExpansion.Casino
             public RectTransform ReadyRect;
             public Vector2 ReadyHome;
             public bool LoggedKeys;
+            public bool SliderHooked;
+
+            public bool StakeOverrideActive;
+            public float StakeOverride;
         }
 
         // TextMeshProUGUI is awkward to name through interop in a few places; this keeps the
@@ -86,6 +90,19 @@ namespace CasinoExpansion.Casino
 
             chrome.Panel = panel;
             chrome.Controller = game;
+            if (!chrome.SliderHooked && panel._betSlider != null)
+            {
+                panel._betSlider.onValueChanged.AddListener((UnityAction<float>)(_ =>
+                {
+                    // Player manually moved the slider, so stop using the exact button value.
+                    chrome.StakeOverrideActive = false;
+
+                    var session = TableSession.For(chrome.Controller);
+                    ReadStake(chrome, session);
+                }));
+
+                chrome.SliderHooked = true;
+            }
             chrome.Root.SetActive(true);
             if (chrome.ReadyRect != null)
                 chrome.ReadyRect.anchoredPosition = chrome.ReadyHome + new Vector2(-88f, 0f);
@@ -296,10 +313,15 @@ namespace CasinoExpansion.Casino
             if (chrome?.Controller == null) return;
 
             var game = TableModes.Get(chrome.Controller);
+            if (chrome.Panel?._betSlider != null)
+                chrome.Panel._betSlider.wholeNumbers = game == ETableGame.Vanilla;
+
             if (chrome.Selector?.Label != null)
                 chrome.Selector.Label.text = TableModes.Describe(game);
+
             if (chrome.Rules?.Label != null)
                 chrome.Rules.Label.text = string.Join("\n", TableRules.For(game));
+
             if (chrome.Players?.Label != null)
                 chrome.Players.Label.text = BuildPlayerList(chrome);
 
@@ -310,17 +332,20 @@ namespace CasinoExpansion.Casino
             {
                 bool asking = live != null && live.Waiting && !live.PromptOnTable;
                 chrome.DecisionRow.SetActive(asking);
-                if (asking) LayOutDecisions(chrome, live.Options);
+
+                if (asking)
+                    LayOutDecisions(chrome, live.Options);
             }
 
             if (chrome.Status?.Label != null)
             {
                 var session = live;
+
                 chrome.Status.Label.text =
                     session != null && session.Waiting ? $"<b>{session.Prompt}</b>" :
-                    game == ETableGame.Vanilla ? "<size=80%>House rules — the table plays as normal.</size>"
-                    : !string.IsNullOrEmpty(session?.LastResult) ? session.LastResult
-                    : "<size=85%>Set your buy-in, then ready up.</size>";
+                    game == ETableGame.Vanilla ? "<size=80%>House rules — the table plays as normal.</size>" :
+                    !string.IsNullOrEmpty(session?.LastResult) ? session.LastResult :
+                    "<size=85%>Set your buy-in, then ready up.</size>";
             }
         }
 
@@ -358,16 +383,31 @@ namespace CasinoExpansion.Casino
             var def = TableGames.For(TableModes.Get(chrome.Controller));
             var session = TableSession.For(chrome.Controller);
             var slider = chrome.Panel?._betSlider;
-            if (def == null || session == null || slider == null) return;
 
-            float target = Mathf.Clamp(session.Stake + delta, def.Limits.Min, def.Limits.Max);
+            if (def == null || session == null || slider == null)
+                return;
+
+            float target = Mathf.Clamp(
+                session.Stake + delta,
+                def.Limits.Min,
+                def.Limits.Max);
+
+            // Lock in the EXACT value requested by the +/- button.
+            chrome.StakeOverride = target;
+            chrome.StakeOverrideActive = true;
+            session.Stake = target;
+
+            // Move the slider visually without triggering its listeners.
             float span = def.Limits.Max - def.Limits.Min;
-            float t = Mathf.Approximately(span, 0f) ? 0f : (target - def.Limits.Min) / span;
+            float t = Mathf.Approximately(span, 0f)
+                ? 0f
+                : (target - def.Limits.Min) / span;
 
-            // Written to the slider rather than to Stake: ReadStake rebuilds Stake from the
-            // slider five times a second, so anything set directly would vanish.
-            slider.value = Mathf.Lerp(slider.minValue, slider.maxValue, t);
-            Refresh(chrome);
+            slider.SetValueWithoutNotify(
+                Mathf.Lerp(slider.minValue, slider.maxValue, t));
+
+            if (chrome.Panel._betAmount != null)
+                chrome.Panel._betAmount.text = $"${target:N0}";
         }
 
         private const int MaxDecisions = 4;
@@ -405,6 +445,17 @@ namespace CasinoExpansion.Casino
 
         public static void TickRefresh()
         {
+            // Keep the modded bet value on screen every frame.
+            // Vanilla rewrites its own clamped value while the slider is moving.
+            foreach (var chrome in Panels.Values)
+            {
+                if (chrome.Root == null || !chrome.Root.activeSelf) continue;
+
+                var session = TableSession.For(chrome.Controller);
+                ReadStake(chrome, session);
+            }
+
+            // Everything else only needs refreshing five times per second.
             if (Time.unscaledTime < _nextTick) return;
             _nextTick = Time.unscaledTime + 0.2f;
 
@@ -475,17 +526,46 @@ namespace CasinoExpansion.Casino
         {
             private static void Postfix(Controller __instance)
             {
-                int id = __instance.GetInstanceID();
-                LocalReady[id] = !IsLocalReady(__instance);
-                foreach (var chrome in Panels.Values)
-                    if (chrome.Controller == __instance) Refresh(chrome);
+                LocalReady.Remove(__instance.GetInstanceID());
+                MelonCoroutines.Start(SuppressFalseLossBanner());
             }
         }
 
         [HarmonyPatch(typeof(Controller), nameof(Controller.Close))]
         internal static class ControllerClosePatch
         {
-            private static void Postfix(Controller __instance) => LocalReady.Remove(__instance.GetInstanceID());
+            private static void Prefix(Controller __instance)
+            {
+                TableSession.CancelFor(__instance);
+            }
+
+            private static void Postfix(Controller __instance)
+            {
+                LocalReady.Remove(__instance.GetInstanceID());
+            }
+        }
+
+        private static System.Collections.IEnumerator SuppressFalseLossBanner()
+        {
+            for (int i = 0; i < 180; i++)
+            {
+                var labels = Object.FindObjectsOfType<Il2CppTMPro.TextMeshProUGUI>();
+
+                foreach (var label in labels)
+                {
+                    if (label == null || string.IsNullOrEmpty(label.text))
+                        continue;
+
+                    if (label.text.IndexOf(
+                            "better luck next time",
+                            StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        label.text = "";
+                    }
+                }
+
+                yield return null;
+            }
         }
     }
 }

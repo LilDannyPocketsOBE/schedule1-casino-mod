@@ -51,13 +51,13 @@ namespace CasinoExpansion.Games
 
             int choice = 0;
             yield return session.Ask(
-                $"Flop {board} — you have {PokerHands.Best(sofar)}. Call ${wager.Opening * 2f:N0}?",
+                $"Flop dealt — you have {DescribeHand(PokerHands.Best(sofar))}. Call ${wager.Opening * 2f:N0}?",
                 new[] { "Call", "Fold" },
                 i => choice = i);
 
             if (choice != 0)
             {
-                session.Announce("Folded — ante lost.");
+                session.Announce("You fold — ante lost.");
                 yield break;
             }
 
@@ -93,7 +93,7 @@ namespace CasinoExpansion.Games
             var dealer = hands[DealerHand];
 
             if (wager.Extra <= 0f)
-                return new Outcome(0f, $"Folded on {board}.");
+                return new Outcome(0f, "You folded after the flop. Ante lost.");
 
             var mineCards = new List<Card>(player.Cards); mineCards.AddRange(board.Cards);
             var theirCards = new List<Card>(dealer.Cards); theirCards.AddRange(board.Cards);
@@ -101,7 +101,8 @@ namespace CasinoExpansion.Games
             var mine = PokerHands.Best(mineCards);
             var theirs = PokerHands.Best(theirCards);
 
-            string detail = $"Board {board}. You {mine} ({player})  vs  dealer {theirs} ({dealer})";
+            string mineText = DescribeHand(mine);
+            string dealerText = DescribeHand(theirs);
 
             // Everything from a pair of fours up qualifies. A pair below that, or no pair at
             // all, does not -- so the check is the pair's rank, not merely having one.
@@ -114,26 +115,72 @@ namespace CasinoExpansion.Games
 
             if (!qualifies)
             {
-                // Ante pays its odds, the call pushes. Still settled on the hands, because a
-                // player holding quads should be paid for them whether or not the dealer
-                // bothered to qualify.
                 float back = ante + ante * AnteOdds(mine) + call;
-                return new Outcome(back / total, $"Dealer does not qualify — ante pays. {detail}");
+                return new Outcome(back / total,
+                    $"Dealer does not qualify with {dealerText}. You have {mineText}; ante pays and call is returned.");
             }
 
             if (mine.Value > theirs.Value)
             {
                 float back = ante + ante * AnteOdds(mine) + call * 2f;
-                return new Outcome(back / total, $"You win with {mine}. {detail}");
+                return new Outcome(back / total,
+                    $"You win with {mineText}. Dealer has {dealerText}.");
             }
 
             if (mine.Value < theirs.Value)
-                return new Outcome(0f, $"Dealer wins with {theirs}. {detail}");
+                return new Outcome(0f,
+                    $"Dealer wins with {dealerText}. You have {mineText}.");
 
-            return new Outcome(1f, $"Tie — stakes returned. {detail}");
+            return new Outcome(1f,
+                $"Tie — both have {mineText}. Stakes returned.");
+        }
+        // The pair's rank sits in the kicker nibble directly below the category.
+        private static int CardRank(PokerHands.Score score, int index)
+        {
+            int shift = 16 - (index * 4);
+            return (score.Value >> shift) & 0xF;
         }
 
-        // The pair's rank sits in the kicker nibble directly below the category.
+        private static string RankName(int rank, bool plural = false)
+        {
+            return rank switch
+            {
+                14 => plural ? "Aces" : "Ace",
+                13 => plural ? "Kings" : "King",
+                12 => plural ? "Queens" : "Queen",
+                11 => plural ? "Jacks" : "Jack",
+                10 => plural ? "Tens" : "Ten",
+                9 => plural ? "Nines" : "Nine",
+                8 => plural ? "Eights" : "Eight",
+                7 => plural ? "Sevens" : "Seven",
+                6 => plural ? "Sixes" : "Six",
+                5 => plural ? "Fives" : "Five",
+                4 => plural ? "Fours" : "Four",
+                3 => plural ? "Threes" : "Three",
+                2 => plural ? "Twos" : "Two",
+                _ => rank.ToString(),
+            };
+        }
+
+        private static string DescribeHand(PokerHands.Score score)
+        {
+            int first = CardRank(score, 0);
+            int second = CardRank(score, 1);
+
+            return score.Rank switch
+            {
+                EHandRank.StraightFlush when first == 14 => "a royal flush",
+                EHandRank.StraightFlush => $"a {RankName(first)}-high straight flush",
+                EHandRank.Quads => $"four {RankName(first, true)}",
+                EHandRank.FullHouse => $"{RankName(first, true)} full of {RankName(second, true)}",
+                EHandRank.Flush => $"a {RankName(first)}-high flush",
+                EHandRank.Straight => $"a {RankName(first)}-high straight",
+                EHandRank.Trips => $"three {RankName(first, true)}",
+                EHandRank.TwoPair => $"two pair, {RankName(first, true)} and {RankName(second, true)}",
+                EHandRank.Pair => $"a pair of {RankName(first, true)}",
+                _ => $"{RankName(first)}-high",
+            };
+        }
         private static int PairRank(PokerHands.Score score) => (score.Value >> 16) & 0xF;
     }
 }

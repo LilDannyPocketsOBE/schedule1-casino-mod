@@ -231,7 +231,7 @@ namespace CasinoExpansion.Casino
         // Deals one card and returns once it has been placed. Face-up throughout: none of the
         // house-banked games in this mod have a hole card, and a face-down card the player can
         // never turn over just reads as a bug.
-        public static bool Place(Controller c, int seat, bool toDealer, Card card, int row = 0, bool faceUp = true)
+        public static bool Place(Controller c, int seat, bool toDealer, Card card, int row = 0, bool faceUp = true, bool centreRow = false)
         {
             var bj = c?.TryCast<Bj>();
             if (bj == null) return false;
@@ -245,7 +245,30 @@ namespace CasinoExpansion.Casino
                 if (slot == null) { MelonLogger.Warning("[cards] no card position free"); return false; }
 
                 var target = slot.position + (overflow > 0 ? Step(bj, seat, toDealer) * overflow : Vector3.zero);
-                if (row > 0) target += RowOffset(bj, seat, toDealer) * row;
+                if (centreRow)
+                {
+                    var mine = bj.GetPlayerCardPositions(seat);
+                    var theirs = bj.DealerCardPositions;
+
+                    if (mine != null && mine.Length > 0 && theirs != null && theirs.Length > 0)
+                    {
+                        int key = (toDealer ? 1000 : 0) + row;
+                        int boardIndex = Used.TryGetValue(key, out var used) ? used - 1 : 0;
+
+                        var towardMiddle = theirs[0].position - mine[0].position;
+                        towardMiddle.y = 0f;
+
+                        target = mine[0].position
+                               + Step(bj, seat, false) * boardIndex
+                               + towardMiddle * 0.5f;
+
+                        slot = mine[0];
+                    }
+                }
+                else if (row > 0)
+                {
+                    target += RowOffset(bj, seat, toDealer) * row;
+                }
 
                 playing.SetCard(Suit(card), Value(card.Rank), true);
                 playing.SetFaceUp(faceUp, true);
@@ -392,9 +415,12 @@ namespace CasinoExpansion.Casino
 
                     // The dealer's first card is the upcard every one of these games shows;
                     // everything else on the dealer's side stays down until the showdown.
-                    bool faceUp = !dealer || round == 0;
+                    var gameId = (ETableGame)(int)hands.Note("game", -1f);
+                    bool hideDealerHand = gameId == ETableGame.ThreeCardPoker || gameId == ETableGame.CasinoHoldem;
+                    bool faceUp = !dealer || (!hideDealerHand && round == 0);
 
-                    Place(c, seat, dealer, hand.Cards[round], RowFor(hands, hi), faceUp);
+                    bool centreRow = hand.Name.Equals("Board", StringComparison.OrdinalIgnoreCase);
+                    Place(c, seat, dealer, hand.Cards[round], RowFor(hands, hi), faceUp, centreRow);
                     yield return new WaitForSeconds(gap);
                 }
             }
